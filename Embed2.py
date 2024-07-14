@@ -10,15 +10,14 @@ def prepare_data(sql_statements, lineages):
     dataset = []
     for sql, lineage in zip(sql_statements, lineages):
         input_text = "Generate SQL lineage: " + sql
-        input_encodings = tokenizer(input_text, padding="max_length", truncation=True, max_length=1024)
+        input_encodings = tokenizer(input_text, padding="max_length", truncation=True, max_length=1024, return_tensors="pt")
         
-        with tokenizer.as_target_tokenizer():
-            target_encodings = tokenizer(lineage, padding="max_length", truncation=True, max_length=512)
+        target_encodings = tokenizer(lineage, padding="max_length", truncation=True, max_length=512, return_tensors="pt")
         
         dataset.append({
-            "input_ids": input_encodings["input_ids"],
-            "attention_mask": input_encodings["attention_mask"],
-            "labels": target_encodings["input_ids"]
+            "input_ids": input_encodings["input_ids"].squeeze(),
+            "attention_mask": input_encodings["attention_mask"].squeeze(),
+            "labels": target_encodings["input_ids"].squeeze()
         })
     
     return dataset

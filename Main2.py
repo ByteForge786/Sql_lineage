@@ -192,6 +192,18 @@ ORDER BY ch.level, ch.total_sales DESC;
     }
 ]
 
+import os
+from embed import prepare_data, tokenizer
+from train import optimize_hyperparameters, cross_validation
+import json
+import datetime
+from transformers import DataCollatorForSeq2Seq
+
+# Complex evaluation data with CTEs
+eval_data = [
+    # ... (keep your existing eval_data here)
+]
+
 def process_subfolder(subfolder_path):
     sql_file = os.path.join(subfolder_path, "sql.txt")
     output_file = os.path.join(subfolder_path, "output.txt")
@@ -234,9 +246,7 @@ def main():
         return
 
     # Prepare evaluation dataset
-    eval_dataset = []
-    for item in eval_data:
-        eval_dataset.extend(prepare_data([item['sql']], [item['lineage']]))
+    eval_dataset = prepare_data([item['sql'] for item in eval_data], [item['lineage'] for item in eval_data])
 
     # Create model save directory
     model_save_path = f"model/{datetime.datetime.now().strftime('%Y-%m-%d-%H-%M-%S')}"

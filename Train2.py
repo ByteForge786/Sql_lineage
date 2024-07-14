@@ -8,6 +8,8 @@ from embed import tokenizer
 import datetime
 import warnings
 import json
+import shutil
+
 warnings.filterwarnings("ignore")
 
 def compute_metrics(eval_preds):
@@ -62,6 +64,8 @@ def cross_validation(dataset, eval_dataset, params, model_save_path, data_collat
     kf = KFold(n_splits=n_splits, shuffle=True, random_state=42)
     
     rouge1_list, rouge2_list, rougeL_list = [], [], []
+    best_model = None
+    best_rouge_avg = -1
     
     for fold, (train_index, val_index) in enumerate(kf.split(dataset)):
         print(f"Training fold {fold + 1}/{n_splits}")
@@ -70,9 +74,6 @@ def cross_validation(dataset, eval_dataset, params, model_save_path, data_collat
         val_dataset = [dataset[i] for i in val_index]
         
         model = train(train_dataset, eval_dataset, params, data_collator)
-        
-        # Save model
-        model.save_pretrained(f"{model_save_path}/fold_{fold}")
         
         # Validate model
         trainer = Trainer(
@@ -87,6 +88,17 @@ def cross_validation(dataset, eval_dataset, params, model_save_path, data_collat
         rougeL_list.append(metrics['eval_rougeL'])
         
         print(f"Fold {fold + 1} - ROUGE-1: {metrics['eval_rouge1']:.3f}, ROUGE-2: {metrics['eval_rouge2']:.3f}, ROUGE-L: {metrics['eval_rougeL']:.3f}")
+        
+        # Check if this model is the best so far
+        current_rouge_avg = (metrics['eval_rouge1'] + metrics['eval_rouge2'] + metrics['eval_rougeL']) / 3
+        if current_rouge_avg > best_rouge_avg:
+            best_rouge_avg = current_rouge_avg
+            best_model = model
+    
+    # Save the best model
+    if best_model:
+        best_model.save_pretrained(model_save_path)
+        print(f"Best model saved to {model_save_path}")
     
     return np.mean(rouge1_list), np.mean(rouge2_list), np.mean(rougeL_list)
 
@@ -97,7 +109,8 @@ def optimize_hyperparameters(dataset, eval_dataset, model_save_path, data_collat
     weight_decay_candidates = [0.01, 0.1]
     
     best_params = None
-    best_rouge = 0
+    best_rouge_avg = -1
+    best_model_path = None
     
     for lr in learning_rate_candidates:
         for bs in batch_size_candidates:
@@ -110,15 +123,32 @@ def optimize_hyperparameters(dataset, eval_dataset, model_save_path, data_collat
                         'weight_decay': wd,
                     }
                     
-                    rouge1, rouge2, rougeL = cross_validation(dataset, eval_dataset, params, model_save_path, data_collator)
-                    avg_rouge = (rouge1 + rouge2 + rougeL) / 3
+                    current_model_path = os.path.join(model_save_path, f"lr{lr}_bs{bs}_epochs{epochs}_wd{wd}")
+                    os.makedirs(current_model_path, exist_ok=True)
+                    
+                    rouge1, rouge2, rougeL = cross_validation(dataset, eval_dataset, params, current_model_path, data_collator)
+                    current_rouge_avg = (rouge1 + rouge2 + rougeL) / 3
                     
                     print(f"Params: {params}")
                     print(f"Results: ROUGE-1={rouge1:.3f}, ROUGE-2={rouge2:.3f}, ROUGE-L={rougeL:.3f}")
                     
-                    if avg_rouge > best_rouge:
-                        best_rouge = avg_rouge
+                    if current_rouge_avg > best_rouge_avg:
+                        best_rouge_avg = current_rouge_avg
                         best_params = params.copy()
+                        best_model_path = current_model_path
+    
+    # Move the best model to the final location
+    final_best_model_path = os.path.join(model_save_path, "best_model")
+    if os.path.exists(final_best_model_path):
+        shutil.rmtree(final_best_model_path)
+    shutil.move(best_model_path, final_best_model_path)
+    
+    # Save best parameters
+    with open(os.path.join(model_save_path, "best_params.json"), "w") as f:
+        json.dump(best_params, f)
+    
+    print(f"Best model saved to {final_best_model_path}")
+    print(f"Best parameters: {best_params}")
     
     return best_params
 

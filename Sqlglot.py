@@ -1,6 +1,6 @@
 import sqlparse
 from sqlparse.sql import IdentifierList, Identifier, Function, Where, Comparison
-from sqlparse.tokens import Keyword, DML, Wildcard
+from sqlparse.tokens import Keyword, DML, Wildcard, Name
 from typing import Dict, Set, List
 import logging
 
@@ -33,8 +33,6 @@ class SQLLineageTracer:
             self._process_delete(statement)
         elif statement.get_type() == 'CREATE':
             self._process_create(statement)
-        else:
-            logger.warning(f"Unhandled statement type: {statement.get_type()}")
 
     def _process_select(self, statement):
         target_table = self._get_target_table(statement)
@@ -47,24 +45,26 @@ class SQLLineageTracer:
                 source_column = f"{table}.{item}"
                 self._add_lineage(target_column, source_column)
 
-        self._process_where_clause(statement, target_table)
-        self._process_join_conditions(statement, target_table)
+        self._process_where_clause(statement, target_table, from_tables)
+        self._process_join_conditions(statement, target_table, from_tables)
 
     def _process_insert(self, statement):
-        target_table = self._get_target_table(statement)
+        target_table = self._get_insert_target_table(statement)
         columns = self._get_insert_columns(statement)
         select_statement = self._get_insert_select(statement)
 
         if select_statement:
             self._process_select(select_statement)
             select_items = self._get_select_items(select_statement)
+            from_tables = self._get_from_tables(select_statement)
             for col, item in zip(columns, select_items):
                 target_column = f"{target_table}.{col}"
-                source_column = f"{self._get_target_table(select_statement)}.{item}"
-                self._add_lineage(target_column, source_column)
+                for table in from_tables:
+                    source_column = f"{table}.{item}"
+                    self._add_lineage(target_column, source_column)
 
     def _process_update(self, statement):
-        target_table = self._get_target_table(statement)
+        target_table = self._get_update_target_table(statement)
         set_items = self._get_update_set_items(statement)
 
         for item in set_items:
@@ -73,26 +73,23 @@ class SQLLineageTracer:
             for source in source_columns:
                 self._add_lineage(target_column, source)
 
-        self._process_where_clause(statement, target_table)
+        self._process_where_clause(statement, target_table, [target_table])
 
     def _process_delete(self, statement):
-        target_table = self._get_target_table(statement)
-        self._process_where_clause(statement, target_table)
+        target_table = self._get_delete_target_table(statement)
+        self._process_where_clause(statement, target_table, [target_table])
 
     def _process_create(self, statement):
-        target_table = self._get_target_table(statement)
+        target_table = self._get_create_target_table(statement)
         select_statement = self._get_create_select(statement)
         if select_statement:
             self._process_select(select_statement)
 
     def _get_target_table(self, statement) -> str:
-        if statement.get_type() in ('SELECT', 'DELETE'):
-            from_clause = next(stmt for stmt in statement.tokens if isinstance(stmt, IdentifierList) or (isinstance(stmt, Identifier) and stmt.get_name() != 'AS'))
-            return str(from_clause.get_real_name())
-        elif statement.get_type() in ('INSERT', 'UPDATE', 'CREATE'):
-            return str(next(token for token in statement.tokens if isinstance(token, Identifier)).get_real_name())
-        else:
-            return 'unknown_table'
+        from_clause = next((token for token in statement.tokens if isinstance(token, Identifier) and token.get_name().upper() == 'FROM'), None)
+        if from_clause:
+            return str(from_clause.tokens[-1])
+        return 'unknown_table'
 
     def _get_from_tables(self, statement) -> List[str]:
         from_seen = False
@@ -106,6 +103,8 @@ class SQLLineageTracer:
                     tables.append(str(token.get_real_name()))
             if token.ttype is Keyword and token.value.upper() == 'FROM':
                 from_seen = True
+            if token.ttype is Keyword and token.value.upper() in ('WHERE', 'GROUP', 'HAVING', 'ORDER'):
+                break
         return tables
 
     def _get_select_items(self, statement) -> List[str]:
@@ -126,27 +125,30 @@ class SQLLineageTracer:
                 break
         return items
 
-    def _get_insert_columns(self, statement) -> List[str]:
-        columns_seen = False
-        columns = []
+    def _get_insert_target_table(self, statement) -> str:
         for token in statement.tokens:
-            if columns_seen:
-                if isinstance(token, IdentifierList):
-                    for identifier in token.get_identifiers():
-                        columns.append(str(identifier.get_real_name()))
-                elif isinstance(token, Identifier):
-                    columns.append(str(token.get_real_name()))
-            if token.ttype is Keyword and token.value.upper() == 'INTO':
-                columns_seen = True
-            elif token.ttype is Keyword and token.value.upper() in ('VALUES', 'SELECT'):
-                break
-        return columns
+            if isinstance(token, Function) and token.get_name().upper() == 'INTO':
+                return str(token.tokens[-1])
+        return 'unknown_table'
+
+    def _get_insert_columns(self, statement) -> List[str]:
+        for token in statement.tokens:
+            if isinstance(token, Function) and token.get_name().upper() == 'INTO':
+                if isinstance(token.tokens[-1], Identifier):
+                    return [str(col) for col in token.tokens[-1].tokens if isinstance(col, Identifier)]
+        return []
 
     def _get_insert_select(self, statement):
         for token in statement.tokens:
             if isinstance(token, IdentifierList) and token.tokens[0].ttype is DML and token.tokens[0].value.upper() == 'SELECT':
                 return token
         return None
+
+    def _get_update_target_table(self, statement) -> str:
+        for token in statement.tokens:
+            if token.ttype is Keyword and token.value.upper() == 'UPDATE':
+                return str(statement.tokens[statement.tokens.index(token) + 1])
+        return 'unknown_table'
 
     def _get_update_set_items(self, statement) -> List[Dict[str, str]]:
         set_seen = False
@@ -166,27 +168,44 @@ class SQLLineageTracer:
                 break
         return items
 
+    def _get_delete_target_table(self, statement) -> str:
+        from_seen = False
+        for token in statement.tokens:
+            if from_seen and isinstance(token, Identifier):
+                return str(token)
+            if token.ttype is Keyword and token.value.upper() == 'FROM':
+                from_seen = True
+        return 'unknown_table'
+
+    def _get_create_target_table(self, statement) -> str:
+        for token in statement.tokens:
+            if isinstance(token, Identifier):
+                return str(token)
+        return 'unknown_table'
+
     def _get_create_select(self, statement):
         for token in statement.tokens:
             if isinstance(token, IdentifierList) and token.tokens[0].ttype is DML and token.tokens[0].value.upper() == 'SELECT':
                 return token
         return None
 
-    def _process_where_clause(self, statement, target_table):
+    def _process_where_clause(self, statement, target_table, from_tables):
         where_clause = next((token for token in statement.tokens if isinstance(token, Where)), None)
         if where_clause:
             columns = self._extract_columns_from_where(where_clause)
             for column in columns:
-                self._add_lineage(f"{target_table}.{column}", column)
+                for table in from_tables:
+                    self._add_lineage(f"{target_table}.{column}", f"{table}.{column}")
 
-    def _process_join_conditions(self, statement, target_table):
+    def _process_join_conditions(self, statement, target_table, from_tables):
         join_seen = False
         for token in statement.tokens:
             if join_seen and isinstance(token, Comparison):
                 left = str(token.left)
                 right = str(token.right)
-                self._add_lineage(f"{target_table}.{left}", left)
-                self._add_lineage(f"{target_table}.{right}", right)
+                for table in from_tables:
+                    self._add_lineage(f"{target_table}.{left}", f"{table}.{left}")
+                    self._add_lineage(f"{target_table}.{right}", f"{table}.{right}")
             if token.ttype is Keyword and token.value.upper() in ('JOIN', 'INNER JOIN', 'LEFT JOIN', 'RIGHT JOIN', 'FULL JOIN'):
                 join_seen = True
             elif token.ttype is Keyword and token.value.upper() in ('WHERE', 'GROUP BY', 'HAVING', 'ORDER BY'):
@@ -222,9 +241,10 @@ class SQLLineageTracer:
         return columns
 
     def _add_lineage(self, target: str, source: str):
-        if target not in self.lineage:
-            self.lineage[target] = set()
-        self.lineage[target].add(source)
+        if target != source:  # Avoid self-referential lineage
+            if target not in self.lineage:
+                self.lineage[target] = set()
+            self.lineage[target].add(source)
 
 def print_lineage(lineage: Dict[str, Set[str]]):
     if lineage:

@@ -52,8 +52,8 @@ class SQLLineageTracer:
         if node.where:
             self._process_where(node.where, target_table)
 
-        if node.group_by:
-            self._process_group_by(node.group_by, target_table)
+        if node.group:
+            self._process_group_by(node.group, target_table)
 
         if node.having:
             self._process_having(node.having, target_table)
@@ -63,7 +63,16 @@ class SQLLineageTracer:
             self._handle_select(select, target_table)
 
     def _handle_insert(self, node: exp.Insert):
-        target_table = node.into.name
+        # Check if 'into' is an attribute or a method
+        if hasattr(node, 'into'):
+            if callable(node.into):
+                target_table = node.into().name
+            else:
+                target_table = node.into.name
+        else:
+            # If 'into' is not available, try to get the table name from the 'expression' attribute
+            target_table = node.expression.name if hasattr(node, 'expression') else 'unknown_table'
+
         if isinstance(node.expression, exp.Select):
             self._handle_select(node.expression, target_table)
 
@@ -162,7 +171,7 @@ class SQLLineageTracer:
         plt.savefig("lineage_graph.png", format="png", dpi=300, bbox_inches='tight')
         plt.close()
 
-# Usage
+# Usage remains the same
 tracer = SQLLineageTracer()
 sql = """
 WITH employee_cte AS (

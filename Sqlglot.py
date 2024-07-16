@@ -1,20 +1,16 @@
 import sqlglot
 from sqlglot import exp
 from typing import Dict, List, Set, Tuple, Optional
-import networkx as nx
-import matplotlib.pyplot as plt
 
 class SQLLineageTracer:
     def __init__(self):
         self.lineage: Dict[str, Set[str]] = {}
         self.ctes: Dict[str, exp.Expression] = {}
-        self.graph = nx.DiGraph()
 
     def trace_lineage(self, sql: str) -> Dict[str, Set[str]]:
         try:
             parsed = sqlglot.parse_one(sql)
             self._process_node(parsed)
-            self._visualize_lineage()
             return self.lineage
         except Exception as e:
             print(f"Error parsing SQL: {e}")
@@ -35,6 +31,8 @@ class SQLLineageTracer:
             self._handle_create(node)
         elif isinstance(node, exp.With):
             self._handle_with(node)
+        elif isinstance(node, exp.Merge):
+            self._handle_merge(node)
 
     def _handle_select(self, node: exp.Select, target_table: Optional[str]):
         if not target_table:
@@ -58,23 +56,28 @@ class SQLLineageTracer:
         if node.having:
             self._process_having(node.having, target_table)
 
+        if node.order:
+            self._process_order_by(node.order, target_table)
+
     def _handle_union(self, node: exp.Union, target_table: Optional[str]):
         for select in node.expressions:
             self._handle_select(select, target_table)
 
     def _handle_insert(self, node: exp.Insert):
-        # Check if 'into' is an attribute or a method
         if hasattr(node, 'into'):
             if callable(node.into):
                 target_table = node.into().name
             else:
                 target_table = node.into.name
         else:
-            # If 'into' is not available, try to get the table name from the 'expression' attribute
             target_table = node.expression.name if hasattr(node, 'expression') else 'unknown_table'
 
         if isinstance(node.expression, exp.Select):
             self._handle_select(node.expression, target_table)
+        elif isinstance(node.expression, exp.Values):
+            for column, value in zip(node.columns, node.expression.expressions):
+                target_column = f"{target_table}.{column.name}"
+                self._add_lineage(target_column, 'literal_value')
 
     def _handle_update(self, node: exp.Update):
         target_table = node.expression.name
@@ -103,6 +106,28 @@ class SQLLineageTracer:
             self._process_node(cte.expression, cte.alias)
         self._process_node(node.expression)
 
+    def _handle_merge(self, node: exp.Merge):
+        target_table = node.into.name
+        self._process_from(node.from_, target_table)
+        if node.on:
+            self._process_where(node.on, target_table)
+        for clause in node.clauses:
+            if isinstance(clause, exp.When):
+                if clause.matched:
+                    if clause.update:
+                        for set_item in clause.update:
+                            target_column = f"{target_table}.{set_item.key}"
+                            source_columns = self._get_source_columns(set_item.value)
+                            for source in source_columns:
+                                self._add_lineage(target_column, source)
+                else:
+                    if clause.insert:
+                        for column, value in zip(clause.insert.columns, clause.insert.values):
+                            target_column = f"{target_table}.{column.name}"
+                            source_columns = self._get_source_columns(value)
+                            for source in source_columns:
+                                self._add_lineage(target_column, source)
+
     def _get_source_columns(self, expr: exp.Expression) -> List[str]:
         if isinstance(expr, exp.Column):
             return [f"{expr.table}.{expr.name}" if expr.table else expr.name]
@@ -114,6 +139,16 @@ class SQLLineageTracer:
             subquery_table = 'subquery'
             self._handle_select(expr.this, subquery_table)
             return [f"{subquery_table}.{col.alias_or_name}" for col in expr.this.expressions]
+        elif isinstance(expr, exp.Literal):
+            return ['literal_value']
+        elif isinstance(expr, exp.Case):
+            sources = []
+            for condition in expr.ifs:
+                sources.extend(self._get_source_columns(condition.this))
+                sources.extend(self._get_source_columns(condition.expression))
+            if expr.default:
+                sources.extend(self._get_source_columns(expr.default))
+            return sources
         return []
 
     def _process_from(self, from_expr: exp.Expression, target_table: str):
@@ -153,25 +188,18 @@ class SQLLineageTracer:
     def _process_having(self, having: exp.Expression, target_table: str):
         self._process_where(having, target_table)
 
+    def _process_order_by(self, order_by: List[exp.Expression], target_table: str):
+        for expr in order_by:
+            source_columns = self._get_source_columns(expr.expression)
+            for source in source_columns:
+                self._add_lineage(f"{target_table}.{expr.expression.name}", source)
+
     def _add_lineage(self, target: str, source: str):
         if target not in self.lineage:
             self.lineage[target] = set()
         self.lineage[target].add(source)
-        self.graph.add_edge(source, target)
 
-    def _visualize_lineage(self):
-        plt.figure(figsize=(20, 10))
-        pos = nx.spring_layout(self.graph)
-        nx.draw(self.graph, pos, with_labels=True, node_color='lightblue', 
-                node_size=3000, font_size=8, arrows=True)
-        nx.draw_networkx_labels(self.graph, pos)
-        plt.title("Data Lineage Graph")
-        plt.axis('off')
-        plt.tight_layout()
-        plt.savefig("lineage_graph.png", format="png", dpi=300, bbox_inches='tight')
-        plt.close()
-
-# Usage remains the same
+# Usage
 tracer = SQLLineageTracer()
 sql = """
 WITH employee_cte AS (
@@ -212,5 +240,3 @@ lineage = tracer.trace_lineage(sql)
 for target, sources in lineage.items():
     for source in sources:
         print(f"{source} -> {target}")
-
-print("\nLineage graph has been saved as 'lineage_graph.png'")

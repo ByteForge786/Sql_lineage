@@ -1,7 +1,7 @@
-import sqlparse
-from sqlparse.sql import IdentifierList, Identifier, Function, Where, Comparison
-from sqlparse.tokens import Keyword, DML, Wildcard, Name
-from typing import Dict, Set, List
+ import sqlparse
+from sqlparse.sql import IdentifierList, Identifier, Function, Where, Comparison, TokenList
+from sqlparse.tokens import Keyword, DML, Wildcard, Name, Punctuation
+from typing import Dict, Set, List, Tuple, Optional
 import logging
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -9,13 +9,13 @@ logger = logging.getLogger(__name__)
 
 class SQLLineageTracer:
     def __init__(self):
-        self.lineage: Dict[str, Set[str]] = {}
-        self.ctes: Dict[str, str] = {}
+        self.lineage: Dict[Tuple[str, str], Set[Tuple[str, str]]] = {}
+        self.ctes: Dict[str, TokenList] = {}
 
-    def trace_lineage(self, sql: str) -> Dict[str, Set[str]]:
+    def trace_lineage(self, sql: str) -> Dict[Tuple[str, str], Set[Tuple[str, str]]]:
         try:
-            parsed = sqlparse.parse(sql)
-            for statement in parsed:
+            statements = sqlparse.parse(sql)
+            for statement in statements:
                 self._process_statement(statement)
             return self.lineage
         except Exception as e:
@@ -23,7 +23,9 @@ class SQLLineageTracer:
             return {}
 
     def _process_statement(self, statement):
-        if statement.get_type() == 'SELECT':
+        if statement.get_type() == 'WITH':
+            self._process_with(statement)
+        elif statement.get_type() == 'SELECT':
             self._process_select(statement)
         elif statement.get_type() == 'INSERT':
             self._process_insert(statement)
@@ -34,62 +36,63 @@ class SQLLineageTracer:
         elif statement.get_type() == 'CREATE':
             self._process_create(statement)
 
-    def _process_select(self, statement):
-        target_table = self._get_target_table(statement)
+    def _process_with(self, statement):
+        for token in statement.tokens:
+            if isinstance(token, Identifier):
+                cte_name = token.get_real_name()
+                cte_query = token.tokens[-1]
+                self.ctes[cte_name] = cte_query
+        main_query = statement.token_next_by(i=sqlparse.sql.Where)[1]
+        self._process_statement(main_query)
+
+    def _process_select(self, statement, target_table='derived_table'):
         from_tables = self._get_from_tables(statement)
         select_items = self._get_select_items(statement)
 
         for item in select_items:
-            target_column = f"{target_table}.{item}"
-            for table in from_tables:
-                source_column = f"{table}.{item}"
-                self._add_lineage(target_column, source_column)
+            target_column = item['alias'] if item['alias'] else item['name']
+            source_columns = self._extract_source_columns(item['expr'], from_tables)
+            for source in source_columns:
+                self._add_lineage((target_table, target_column), source)
 
-        self._process_where_clause(statement, target_table, from_tables)
-        self._process_join_conditions(statement, target_table, from_tables)
+        self._process_joins(statement, target_table)
+        self._process_where(statement, target_table)
+        self._process_group_by(statement, target_table)
+        self._process_having(statement, target_table)
 
     def _process_insert(self, statement):
         target_table = self._get_insert_target_table(statement)
-        columns = self._get_insert_columns(statement)
+        target_columns = self._get_insert_columns(statement)
         select_statement = self._get_insert_select(statement)
 
         if select_statement:
-            self._process_select(select_statement)
             select_items = self._get_select_items(select_statement)
-            from_tables = self._get_from_tables(select_statement)
-            for col, item in zip(columns, select_items):
-                target_column = f"{target_table}.{col}"
-                for table in from_tables:
-                    source_column = f"{table}.{item}"
-                    self._add_lineage(target_column, source_column)
+            for target_col, select_item in zip(target_columns, select_items):
+                source_columns = self._extract_source_columns(select_item['expr'], self._get_from_tables(select_statement))
+                for source in source_columns:
+                    self._add_lineage((target_table, target_col), source)
 
     def _process_update(self, statement):
         target_table = self._get_update_target_table(statement)
         set_items = self._get_update_set_items(statement)
 
         for item in set_items:
-            target_column = f"{target_table}.{item['column']}"
-            source_columns = self._extract_columns_from_expression(item['value'])
+            target_column = item['column']
+            source_columns = self._extract_source_columns(item['value'], [target_table])
             for source in source_columns:
-                self._add_lineage(target_column, source)
+                self._add_lineage((target_table, target_column), source)
 
-        self._process_where_clause(statement, target_table, [target_table])
+        self._process_where(statement, target_table)
 
     def _process_delete(self, statement):
         target_table = self._get_delete_target_table(statement)
-        self._process_where_clause(statement, target_table, [target_table])
+        self._process_where(statement, target_table)
 
     def _process_create(self, statement):
         target_table = self._get_create_target_table(statement)
         select_statement = self._get_create_select(statement)
         if select_statement:
-            self._process_select(select_statement)
-
-    def _get_target_table(self, statement) -> str:
-        from_clause = next((token for token in statement.tokens if isinstance(token, Identifier) and token.get_name().upper() == 'FROM'), None)
-        if from_clause:
-            return str(from_clause.tokens[-1])
-        return 'unknown_table'
+            self._process_select(select_statement, target_table)
 
     def _get_from_tables(self, statement) -> List[str]:
         from_seen = False
@@ -98,32 +101,46 @@ class SQLLineageTracer:
             if from_seen:
                 if isinstance(token, IdentifierList):
                     for identifier in token.get_identifiers():
-                        tables.append(str(identifier.get_real_name()))
+                        tables.append(self._get_table_name(identifier))
                 elif isinstance(token, Identifier):
-                    tables.append(str(token.get_real_name()))
+                    tables.append(self._get_table_name(token))
             if token.ttype is Keyword and token.value.upper() == 'FROM':
                 from_seen = True
             if token.ttype is Keyword and token.value.upper() in ('WHERE', 'GROUP', 'HAVING', 'ORDER'):
                 break
         return tables
 
-    def _get_select_items(self, statement) -> List[str]:
+    def _get_table_name(self, identifier):
+        if identifier.has_alias():
+            return identifier.get_alias()
+        elif identifier.get_real_name() in self.ctes:
+            return identifier.get_real_name()
+        else:
+            return str(identifier.get_real_name())
+
+    def _get_select_items(self, statement) -> List[Dict]:
         select_seen = False
         items = []
         for token in statement.tokens:
             if select_seen:
                 if isinstance(token, IdentifierList):
                     for identifier in token.get_identifiers():
-                        items.append(str(identifier.get_real_name()))
+                        items.append(self._parse_select_item(identifier))
                 elif isinstance(token, Identifier):
-                    items.append(str(token.get_real_name()))
+                    items.append(self._parse_select_item(token))
                 elif token.ttype is Wildcard:
-                    items.append('*')
+                    items.append({'name': '*', 'alias': None, 'expr': token})
             if token.ttype is DML and token.value.upper() == 'SELECT':
                 select_seen = True
             elif token.ttype is Keyword and token.value.upper() in ('FROM', 'WHERE'):
                 break
         return items
+
+    def _parse_select_item(self, item):
+        if item.has_alias():
+            return {'name': str(item.get_real_name()), 'alias': str(item.get_alias()), 'expr': item}
+        else:
+            return {'name': str(item.get_real_name()), 'alias': None, 'expr': item}
 
     def _get_insert_target_table(self, statement) -> str:
         for token in statement.tokens:
@@ -160,7 +177,7 @@ class SQLLineageTracer:
                         if isinstance(identifier, Comparison):
                             items.append({
                                 'column': str(identifier.left),
-                                'value': str(identifier.right)
+                                'value': identifier.right
                             })
             if token.ttype is Keyword and token.value.upper() == 'SET':
                 set_seen = True
@@ -189,69 +206,92 @@ class SQLLineageTracer:
                 return token
         return None
 
-    def _process_where_clause(self, statement, target_table, from_tables):
-        where_clause = next((token for token in statement.tokens if isinstance(token, Where)), None)
-        if where_clause:
-            columns = self._extract_columns_from_where(where_clause)
-            for column in columns:
+    def _extract_source_columns(self, expr, from_tables) -> List[Tuple[str, str]]:
+        if isinstance(expr, Identifier):
+            if expr.has_alias():
+                return self._extract_source_columns(expr.tokens[0], from_tables)
+            else:
                 for table in from_tables:
-                    self._add_lineage(f"{target_table}.{column}", f"{table}.{column}")
+                    if expr.get_parent_name() == table or expr.get_parent_name() is None:
+                        return [(table, str(expr.get_real_name()))]
+        elif isinstance(expr, Function):
+            sources = []
+            for arg in expr.get_parameters():
+                sources.extend(self._extract_source_columns(arg, from_tables))
+            return sources
+        elif isinstance(expr, Comparison):
+            return self._extract_source_columns(expr.left, from_tables) + self._extract_source_columns(expr.right, from_tables)
+        elif isinstance(expr, TokenList):
+            sources = []
+            for token in expr.tokens:
+                if not token.is_whitespace and token.ttype is not Punctuation:
+                    sources.extend(self._extract_source_columns(token, from_tables))
+            return sources
+        return []
 
-    def _process_join_conditions(self, statement, target_table, from_tables):
+    def _process_joins(self, statement, target_table):
         join_seen = False
         for token in statement.tokens:
             if join_seen and isinstance(token, Comparison):
-                left = str(token.left)
-                right = str(token.right)
-                for table in from_tables:
-                    self._add_lineage(f"{target_table}.{left}", f"{table}.{left}")
-                    self._add_lineage(f"{target_table}.{right}", f"{table}.{right}")
+                left_sources = self._extract_source_columns(token.left, [target_table])
+                right_sources = self._extract_source_columns(token.right, [target_table])
+                for left in left_sources:
+                    for right in right_sources:
+                        self._add_lineage((target_table, left[1]), right)
+                        self._add_lineage((target_table, right[1]), left)
             if token.ttype is Keyword and token.value.upper() in ('JOIN', 'INNER JOIN', 'LEFT JOIN', 'RIGHT JOIN', 'FULL JOIN'):
                 join_seen = True
             elif token.ttype is Keyword and token.value.upper() in ('WHERE', 'GROUP BY', 'HAVING', 'ORDER BY'):
                 break
 
-    def _extract_columns_from_where(self, where_clause) -> Set[str]:
-        columns = set()
-        for token in where_clause.tokens:
-            if isinstance(token, Comparison):
-                columns.add(str(token.left))
-                columns.add(str(token.right))
-            elif isinstance(token, Function):
-                columns.update(self._extract_columns_from_function(token))
-        return columns
+    def _process_where(self, statement, target_table):
+        where_clause = statement.token_next_by(i=sqlparse.sql.Where)
+        if where_clause:
+            self._process_condition(where_clause[1], target_table)
 
-    def _extract_columns_from_function(self, function) -> Set[str]:
-        columns = set()
-        for token in function.tokens:
-            if isinstance(token, Identifier):
-                columns.add(str(token))
-            elif isinstance(token, Function):
-                columns.update(self._extract_columns_from_function(token))
-        return columns
+    def _process_group_by(self, statement, target_table):
+        group_by_seen = False
+        for token in statement.tokens:
+            if group_by_seen and isinstance(token, IdentifierList):
+                for identifier in token.get_identifiers():
+                    sources = self._extract_source_columns(identifier, [target_table])
+                    for source in sources:
+                        self._add_lineage((target_table, str(identifier)), source)
+            if token.ttype is Keyword and token.value.upper() == 'GROUP BY':
+                group_by_seen = True
+            elif token.ttype is Keyword and token.value.upper() in ('HAVING', 'ORDER BY'):
+                break
 
-    def _extract_columns_from_expression(self, expression) -> Set[str]:
-        columns = set()
-        tokens = sqlparse.parse(expression)[0].tokens
-        for token in tokens:
-            if isinstance(token, Identifier):
-                columns.add(str(token))
-            elif isinstance(token, Function):
-                columns.update(self._extract_columns_from_function(token))
-        return columns
+    def _process_having(self, statement, target_table):
+        having_clause = statement.token_next_by(m=(Keyword, 'HAVING'))
+        if having_clause:
+            self._process_condition(having_clause[1], target_table)
 
-    def _add_lineage(self, target: str, source: str):
+    def _process_condition(self, condition, target_table):
+        if isinstance(condition, Comparison):
+            left_sources = self._extract_source_columns(condition.left, [target_table])
+            right_sources = self._extract_source_columns(condition.right, [target_table])
+            for left in left_sources:
+                for right in right_sources:
+                    self._add_lineage((target_table, left[1]), right)
+                    self._add_lineage((target_table, right[1]), left)
+        elif isinstance(condition, TokenList):
+            for token in condition.tokens:
+                if isinstance(token, Comparison):
+                    self._process_condition(token, target_table)
+
+    def _add_lineage(self, target: Tuple[str, str], source: Tuple[str, str]):
         if target != source:  # Avoid self-referential lineage
             if target not in self.lineage:
                 self.lineage[target] = set()
             self.lineage[target].add(source)
 
-def print_lineage(lineage: Dict[str, Set[str]]):
+def print_lineage(lineage: Dict[Tuple[str, str], Set[Tuple[str, str]]]):
     if lineage:
         print("Lineage relationships:")
         for target, sources in lineage.items():
             for source in sources:
-                print(f"{source} -> {target}")
+                print(f"{source[0]}.{source[1]} -> {target[0]}.{target[1]}")
     else:
         print("No lineage relationships found.")
 

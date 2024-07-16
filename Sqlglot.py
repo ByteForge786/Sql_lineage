@@ -1,4 +1,4 @@
- import sqlparse
+import sqlparse
 from sqlparse.sql import IdentifierList, Identifier, Function, Where, Comparison, Parenthesis
 from typing import List, Dict, Set, Tuple
 
@@ -15,16 +15,30 @@ class SQLLineage:
         return self.lineage
 
     def _analyze_statement(self, statement, parent_alias=None):
-        if statement.get_type() == 'SELECT':
+        if isinstance(statement, sqlparse.sql.Statement):
+            stmt_type = statement.get_type()
+        else:
+            stmt_type = self._infer_statement_type(statement)
+
+        if stmt_type == 'SELECT':
             return self._analyze_select(statement, parent_alias)
-        elif statement.get_type() == 'INSERT':
+        elif stmt_type == 'INSERT':
             return self._analyze_insert(statement)
-        elif statement.get_type() == 'UPDATE':
+        elif stmt_type == 'UPDATE':
             return self._analyze_update(statement)
-        elif statement.get_type() == 'DELETE':
+        elif stmt_type == 'DELETE':
             return self._analyze_delete(statement)
-        elif statement.get_type() == 'CREATE':
+        elif stmt_type == 'CREATE':
             return self._analyze_create(statement)
+
+    def _infer_statement_type(self, statement):
+        first_token = statement.token_first()
+        if first_token:
+            if first_token.ttype is sqlparse.tokens.DML:
+                return first_token.value.upper()
+            elif first_token.ttype is sqlparse.tokens.DDL:
+                return first_token.value.upper()
+        return 'UNKNOWN'
 
     def _analyze_select(self, statement, parent_alias=None):
         ctes = self._extract_ctes(statement)
@@ -174,7 +188,7 @@ class SQLLineage:
         return into_token.get_real_name()
 
     def _extract_insert_source(self, statement) -> sqlparse.sql.Statement:
-        select_token = next(token for token in statement.tokens if isinstance(token, sqlparse.sql.Statement) and token.get_type() == 'SELECT')
+        select_token = next(token for token in statement.tokens if isinstance(token, sqlparse.sql.Statement) and self._infer_statement_type(token) == 'SELECT')
         return select_token
 
     def _extract_update_target(self, statement) -> str:
@@ -210,22 +224,24 @@ class SQLLineage:
                 columns.append(token.get_real_name())
         return columns
 
-# Usage
-lineage_analyzer = SQLLineage()
-query = """
-WITH cte1 AS (
-    SELECT id, name FROM users WHERE status = 'active'
-), cte2 AS (
-    SELECT o.id as order_id, o.user_id, o.total
-    FROM orders o
-    JOIN cte1 c ON o.user_id = c.id
-    WHERE o.status = 'completed'
-)
-SELECT c.name, c2.order_id, c2.total,
-       (SELECT AVG(total) FROM cte2 WHERE user_id = c.id) as avg_order
-FROM cte1 c
-LEFT JOIN cte2 c2 ON c.id = c2.user_id
-WHERE c2.total > 100
-"""
-result = lineage_analyzer.parse_query(query)
-print(result)
+# Usage example
+if __name__ == "__main__":
+    lineage_analyzer = SQLLineage()
+    query = """
+    WITH cte1 AS (
+        SELECT id, name FROM users WHERE status = 'active'
+    ), cte2 AS (
+        SELECT o.id as order_id, o.user_id, o.total
+        FROM orders o
+        JOIN cte1 c ON o.user_id = c.id
+        WHERE o.status = 'completed'
+    )
+    SELECT c.name, c2.order_id, c2.total,
+           (SELECT AVG(total) FROM cte2 WHERE user_id = c.id) as avg_order
+    FROM cte1 c
+    LEFT JOIN cte2 c2 ON c.id = c2.user_id
+    WHERE c2.total > 100
+    """
+    result = lineage_analyzer.parse_query(query)
+    for target, sources in result.items():
+        print(f"{target}: {sources}")

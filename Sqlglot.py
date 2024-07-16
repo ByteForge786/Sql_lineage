@@ -1,297 +1,259 @@
- import sqlparse
-from sqlparse.sql import IdentifierList, Identifier, Function, Where, Comparison, TokenList
-from sqlparse.tokens import Keyword, DML, Wildcard, Name, Punctuation
-from typing import Dict, Set, List, Tuple, Optional
+import sqlglot
+from sqlglot import exp
+from typing import Dict, List, Set, Tuple, Optional
 import logging
 
+# Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 class SQLLineageTracer:
     def __init__(self):
-        self.lineage: Dict[Tuple[str, str], Set[Tuple[str, str]]] = {}
-        self.ctes: Dict[str, TokenList] = {}
+        self.lineage: Dict[str, Set[str]] = {}
+        self.ctes: Dict[str, exp.Expression] = {}
 
-    def trace_lineage(self, sql: str) -> Dict[Tuple[str, str], Set[Tuple[str, str]]]:
+    def trace_lineage(self, sql: str) -> Dict[str, Set[str]]:
         try:
-            statements = sqlparse.parse(sql)
-            for statement in statements:
-                self._process_statement(statement)
+            parsed = sqlglot.parse_one(sql)
+            logger.info("SQL parsed successfully")
+            self._process_node(parsed)
             return self.lineage
+        except sqlglot.ParseError as e:
+            logger.error(f"SQL parsing error: {e}")
+            return {}
         except Exception as e:
-            logger.error(f"Error tracing lineage: {e}")
+            logger.error(f"Unexpected error during lineage tracing: {e}")
             return {}
 
-    def _process_statement(self, statement):
-        if statement.get_type() == 'WITH':
-            self._process_with(statement)
-        elif statement.get_type() == 'SELECT':
-            self._process_select(statement)
-        elif statement.get_type() == 'INSERT':
-            self._process_insert(statement)
-        elif statement.get_type() == 'UPDATE':
-            self._process_update(statement)
-        elif statement.get_type() == 'DELETE':
-            self._process_delete(statement)
-        elif statement.get_type() == 'CREATE':
-            self._process_create(statement)
-
-    def _process_with(self, statement):
-        for token in statement.tokens:
-            if isinstance(token, Identifier):
-                cte_name = token.get_real_name()
-                cte_query = token.tokens[-1]
-                self.ctes[cte_name] = cte_query
-        main_query = statement.token_next_by(i=sqlparse.sql.Where)[1]
-        self._process_statement(main_query)
-
-    def _process_select(self, statement, target_table='derived_table'):
-        from_tables = self._get_from_tables(statement)
-        select_items = self._get_select_items(statement)
-
-        for item in select_items:
-            target_column = item['alias'] if item['alias'] else item['name']
-            source_columns = self._extract_source_columns(item['expr'], from_tables)
-            for source in source_columns:
-                self._add_lineage((target_table, target_column), source)
-
-        self._process_joins(statement, target_table)
-        self._process_where(statement, target_table)
-        self._process_group_by(statement, target_table)
-        self._process_having(statement, target_table)
-
-    def _process_insert(self, statement):
-        target_table = self._get_insert_target_table(statement)
-        target_columns = self._get_insert_columns(statement)
-        select_statement = self._get_insert_select(statement)
-
-        if select_statement:
-            select_items = self._get_select_items(select_statement)
-            for target_col, select_item in zip(target_columns, select_items):
-                source_columns = self._extract_source_columns(select_item['expr'], self._get_from_tables(select_statement))
-                for source in source_columns:
-                    self._add_lineage((target_table, target_col), source)
-
-    def _process_update(self, statement):
-        target_table = self._get_update_target_table(statement)
-        set_items = self._get_update_set_items(statement)
-
-        for item in set_items:
-            target_column = item['column']
-            source_columns = self._extract_source_columns(item['value'], [target_table])
-            for source in source_columns:
-                self._add_lineage((target_table, target_column), source)
-
-        self._process_where(statement, target_table)
-
-    def _process_delete(self, statement):
-        target_table = self._get_delete_target_table(statement)
-        self._process_where(statement, target_table)
-
-    def _process_create(self, statement):
-        target_table = self._get_create_target_table(statement)
-        select_statement = self._get_create_select(statement)
-        if select_statement:
-            self._process_select(select_statement, target_table)
-
-    def _get_from_tables(self, statement) -> List[str]:
-        from_seen = False
-        tables = []
-        for token in statement.tokens:
-            if from_seen:
-                if isinstance(token, IdentifierList):
-                    for identifier in token.get_identifiers():
-                        tables.append(self._get_table_name(identifier))
-                elif isinstance(token, Identifier):
-                    tables.append(self._get_table_name(token))
-            if token.ttype is Keyword and token.value.upper() == 'FROM':
-                from_seen = True
-            if token.ttype is Keyword and token.value.upper() in ('WHERE', 'GROUP', 'HAVING', 'ORDER'):
-                break
-        return tables
-
-    def _get_table_name(self, identifier):
-        if identifier.has_alias():
-            return identifier.get_alias()
-        elif identifier.get_real_name() in self.ctes:
-            return identifier.get_real_name()
-        else:
-            return str(identifier.get_real_name())
-
-    def _get_select_items(self, statement) -> List[Dict]:
-        select_seen = False
-        items = []
-        for token in statement.tokens:
-            if select_seen:
-                if isinstance(token, IdentifierList):
-                    for identifier in token.get_identifiers():
-                        items.append(self._parse_select_item(identifier))
-                elif isinstance(token, Identifier):
-                    items.append(self._parse_select_item(token))
-                elif token.ttype is Wildcard:
-                    items.append({'name': '*', 'alias': None, 'expr': token})
-            if token.ttype is DML and token.value.upper() == 'SELECT':
-                select_seen = True
-            elif token.ttype is Keyword and token.value.upper() in ('FROM', 'WHERE'):
-                break
-        return items
-
-    def _parse_select_item(self, item):
-        if item.has_alias():
-            return {'name': str(item.get_real_name()), 'alias': str(item.get_alias()), 'expr': item}
-        else:
-            return {'name': str(item.get_real_name()), 'alias': None, 'expr': item}
-
-    def _get_insert_target_table(self, statement) -> str:
-        for token in statement.tokens:
-            if isinstance(token, Function) and token.get_name().upper() == 'INTO':
-                return str(token.tokens[-1])
-        return 'unknown_table'
-
-    def _get_insert_columns(self, statement) -> List[str]:
-        for token in statement.tokens:
-            if isinstance(token, Function) and token.get_name().upper() == 'INTO':
-                if isinstance(token.tokens[-1], Identifier):
-                    return [str(col) for col in token.tokens[-1].tokens if isinstance(col, Identifier)]
-        return []
-
-    def _get_insert_select(self, statement):
-        for token in statement.tokens:
-            if isinstance(token, IdentifierList) and token.tokens[0].ttype is DML and token.tokens[0].value.upper() == 'SELECT':
-                return token
-        return None
-
-    def _get_update_target_table(self, statement) -> str:
-        for token in statement.tokens:
-            if token.ttype is Keyword and token.value.upper() == 'UPDATE':
-                return str(statement.tokens[statement.tokens.index(token) + 1])
-        return 'unknown_table'
-
-    def _get_update_set_items(self, statement) -> List[Dict[str, str]]:
-        set_seen = False
-        items = []
-        for token in statement.tokens:
-            if set_seen:
-                if isinstance(token, IdentifierList):
-                    for identifier in token.get_identifiers():
-                        if isinstance(identifier, Comparison):
-                            items.append({
-                                'column': str(identifier.left),
-                                'value': identifier.right
-                            })
-            if token.ttype is Keyword and token.value.upper() == 'SET':
-                set_seen = True
-            elif token.ttype is Keyword and token.value.upper() == 'WHERE':
-                break
-        return items
-
-    def _get_delete_target_table(self, statement) -> str:
-        from_seen = False
-        for token in statement.tokens:
-            if from_seen and isinstance(token, Identifier):
-                return str(token)
-            if token.ttype is Keyword and token.value.upper() == 'FROM':
-                from_seen = True
-        return 'unknown_table'
-
-    def _get_create_target_table(self, statement) -> str:
-        for token in statement.tokens:
-            if isinstance(token, Identifier):
-                return str(token)
-        return 'unknown_table'
-
-    def _get_create_select(self, statement):
-        for token in statement.tokens:
-            if isinstance(token, IdentifierList) and token.tokens[0].ttype is DML and token.tokens[0].value.upper() == 'SELECT':
-                return token
-        return None
-
-    def _extract_source_columns(self, expr, from_tables) -> List[Tuple[str, str]]:
-        if isinstance(expr, Identifier):
-            if expr.has_alias():
-                return self._extract_source_columns(expr.tokens[0], from_tables)
+    def _process_node(self, node: exp.Expression, target_table: Optional[str] = None):
+        try:
+            if isinstance(node, exp.Select):
+                self._handle_select(node, target_table)
+            elif isinstance(node, exp.Union):
+                self._handle_union(node, target_table)
+            elif isinstance(node, exp.Insert):
+                self._handle_insert(node)
+            elif isinstance(node, exp.Update):
+                self._handle_update(node)
+            elif isinstance(node, exp.Delete):
+                self._handle_delete(node)
+            elif isinstance(node, exp.Create):
+                self._handle_create(node)
+            elif isinstance(node, exp.With):
+                self._handle_with(node)
+            elif isinstance(node, exp.Merge):
+                self._handle_merge(node)
             else:
-                for table in from_tables:
-                    if expr.get_parent_name() == table or expr.get_parent_name() is None:
-                        return [(table, str(expr.get_real_name()))]
-        elif isinstance(expr, Function):
-            sources = []
-            for arg in expr.get_parameters():
-                sources.extend(self._extract_source_columns(arg, from_tables))
-            return sources
-        elif isinstance(expr, Comparison):
-            return self._extract_source_columns(expr.left, from_tables) + self._extract_source_columns(expr.right, from_tables)
-        elif isinstance(expr, TokenList):
-            sources = []
-            for token in expr.tokens:
-                if not token.is_whitespace and token.ttype is not Punctuation:
-                    sources.extend(self._extract_source_columns(token, from_tables))
-            return sources
-        return []
+                logger.warning(f"Unhandled node type: {type(node)}")
+        except Exception as e:
+            logger.error(f"Error processing node {type(node)}: {e}")
 
-    def _process_joins(self, statement, target_table):
-        join_seen = False
-        for token in statement.tokens:
-            if join_seen and isinstance(token, Comparison):
-                left_sources = self._extract_source_columns(token.left, [target_table])
-                right_sources = self._extract_source_columns(token.right, [target_table])
-                for left in left_sources:
-                    for right in right_sources:
-                        self._add_lineage((target_table, left[1]), right)
-                        self._add_lineage((target_table, right[1]), left)
-            if token.ttype is Keyword and token.value.upper() in ('JOIN', 'INNER JOIN', 'LEFT JOIN', 'RIGHT JOIN', 'FULL JOIN'):
-                join_seen = True
-            elif token.ttype is Keyword and token.value.upper() in ('WHERE', 'GROUP BY', 'HAVING', 'ORDER BY'):
-                break
+    def _handle_select(self, node: exp.Select, target_table: Optional[str]):
+        if not target_table:
+            target_table = node.alias or 'derived_table'
+        logger.debug(f"Processing SELECT for target table: {target_table}")
 
-    def _process_where(self, statement, target_table):
-        where_clause = statement.token_next_by(i=sqlparse.sql.Where)
-        if where_clause:
-            self._process_condition(where_clause[1], target_table)
+        for expr in node.expressions:
+            target_column = f"{target_table}.{expr.alias_or_name}"
+            source_columns = self._get_source_columns(expr)
+            for source in source_columns:
+                self._add_lineage(target_column, source)
 
-    def _process_group_by(self, statement, target_table):
-        group_by_seen = False
-        for token in statement.tokens:
-            if group_by_seen and isinstance(token, IdentifierList):
-                for identifier in token.get_identifiers():
-                    sources = self._extract_source_columns(identifier, [target_table])
-                    for source in sources:
-                        self._add_lineage((target_table, str(identifier)), source)
-            if token.ttype is Keyword and token.value.upper() == 'GROUP BY':
-                group_by_seen = True
-            elif token.ttype is Keyword and token.value.upper() in ('HAVING', 'ORDER BY'):
-                break
+        if node.from_:
+            self._process_from(node.from_, target_table)
 
-    def _process_having(self, statement, target_table):
-        having_clause = statement.token_next_by(m=(Keyword, 'HAVING'))
-        if having_clause:
-            self._process_condition(having_clause[1], target_table)
+        if node.where:
+            self._process_where(node.where, target_table)
 
-    def _process_condition(self, condition, target_table):
-        if isinstance(condition, Comparison):
-            left_sources = self._extract_source_columns(condition.left, [target_table])
-            right_sources = self._extract_source_columns(condition.right, [target_table])
-            for left in left_sources:
-                for right in right_sources:
-                    self._add_lineage((target_table, left[1]), right)
-                    self._add_lineage((target_table, right[1]), left)
-        elif isinstance(condition, TokenList):
-            for token in condition.tokens:
-                if isinstance(token, Comparison):
-                    self._process_condition(token, target_table)
+        if node.group:
+            self._process_group_by(node.group, target_table)
 
-    def _add_lineage(self, target: Tuple[str, str], source: Tuple[str, str]):
-        if target != source:  # Avoid self-referential lineage
-            if target not in self.lineage:
-                self.lineage[target] = set()
-            self.lineage[target].add(source)
+        if node.having:
+            self._process_having(node.having, target_table)
 
-def print_lineage(lineage: Dict[Tuple[str, str], Set[Tuple[str, str]]]):
+        if node.order:
+            self._process_order_by(node.order, target_table)
+
+    def _handle_union(self, node: exp.Union, target_table: Optional[str]):
+        logger.debug("Processing UNION")
+        for select in node.expressions:
+            self._handle_select(select, target_table)
+
+    def _handle_insert(self, node: exp.Insert):
+        logger.debug("Processing INSERT")
+        if hasattr(node, 'into'):
+            if callable(node.into):
+                target_table = node.into().name
+            else:
+                target_table = node.into.name
+        else:
+            target_table = node.expression.name if hasattr(node, 'expression') else 'unknown_table'
+        
+        logger.debug(f"Insert target table: {target_table}")
+
+        if isinstance(node.expression, exp.Select):
+            self._handle_select(node.expression, target_table)
+        elif isinstance(node.expression, exp.Values):
+            for column, value in zip(node.columns, node.expression.expressions):
+                target_column = f"{target_table}.{column.name}"
+                self._add_lineage(target_column, 'literal_value')
+
+    def _handle_update(self, node: exp.Update):
+        logger.debug("Processing UPDATE")
+        target_table = node.expression.name
+        for set_item in node.set:
+            target_column = f"{target_table}.{set_item.key}"
+            source_columns = self._get_source_columns(set_item.value)
+            for source in source_columns:
+                self._add_lineage(target_column, source)
+
+        if node.where:
+            self._process_where(node.where, target_table)
+
+    def _handle_delete(self, node: exp.Delete):
+        logger.debug("Processing DELETE")
+        target_table = node.expression.name
+        if node.where:
+            self._process_where(node.where, target_table)
+
+    def _handle_create(self, node: exp.Create):
+        logger.debug("Processing CREATE")
+        if isinstance(node.expression, exp.Select):
+            target_table = node.this.name
+            self._handle_select(node.expression, target_table)
+
+    def _handle_with(self, node: exp.With):
+        logger.debug("Processing WITH")
+        for cte in node.expressions:
+            self.ctes[cte.alias] = cte.expression
+            self._process_node(cte.expression, cte.alias)
+        self._process_node(node.expression)
+
+    def _handle_merge(self, node: exp.Merge):
+        logger.debug("Processing MERGE")
+        target_table = node.into.name
+        self._process_from(node.from_, target_table)
+        if node.on:
+            self._process_where(node.on, target_table)
+        for clause in node.clauses:
+            if isinstance(clause, exp.When):
+                if clause.matched:
+                    if clause.update:
+                        for set_item in clause.update:
+                            target_column = f"{target_table}.{set_item.key}"
+                            source_columns = self._get_source_columns(set_item.value)
+                            for source in source_columns:
+                                self._add_lineage(target_column, source)
+                else:
+                    if clause.insert:
+                        for column, value in zip(clause.insert.columns, clause.insert.values):
+                            target_column = f"{target_table}.{column.name}"
+                            source_columns = self._get_source_columns(value)
+                            for source in source_columns:
+                                self._add_lineage(target_column, source)
+
+    def _get_source_columns(self, expr: exp.Expression) -> List[str]:
+        try:
+            if isinstance(expr, exp.Column):
+                return [f"{expr.table}.{expr.name}" if expr.table else expr.name]
+            elif isinstance(expr, exp.Function):
+                return [col for arg in expr.args for col in self._get_source_columns(arg)]
+            elif isinstance(expr, exp.Binary):
+                return self._get_source_columns(expr.left) + self._get_source_columns(expr.right)
+            elif isinstance(expr, exp.Subquery):
+                subquery_table = 'subquery'
+                self._handle_select(expr.this, subquery_table)
+                return [f"{subquery_table}.{col.alias_or_name}" for col in expr.this.expressions]
+            elif isinstance(expr, exp.Literal):
+                return ['literal_value']
+            elif isinstance(expr, exp.Case):
+                sources = []
+                for condition in expr.ifs:
+                    sources.extend(self._get_source_columns(condition.this))
+                    sources.extend(self._get_source_columns(condition.expression))
+                if expr.default:
+                    sources.extend(self._get_source_columns(expr.default))
+                return sources
+            else:
+                logger.warning(f"Unhandled expression type in _get_source_columns: {type(expr)}")
+                return []
+        except Exception as e:
+            logger.error(f"Error in _get_source_columns: {e}")
+            return []
+
+    def _process_from(self, from_expr: exp.Expression, target_table: str):
+        try:
+            if isinstance(from_expr, exp.Join):
+                self._process_join(from_expr, target_table)
+            elif isinstance(from_expr, exp.Subquery):
+                self._handle_select(from_expr.this, from_expr.alias)
+            elif isinstance(from_expr, exp.Table):
+                pass  # Base table, no further processing needed
+            else:
+                self._process_node(from_expr, target_table)
+        except Exception as e:
+            logger.error(f"Error in _process_from: {e}")
+
+    def _process_join(self, join: exp.Join, target_table: str):
+        try:
+            self._process_from(join.left, target_table)
+            self._process_from(join.right, target_table)
+            if join.on:
+                self._process_where(join.on, target_table)
+        except Exception as e:
+            logger.error(f"Error in _process_join: {e}")
+
+    def _process_where(self, where: exp.Expression, target_table: str):
+        try:
+            if isinstance(where, exp.Binary):
+                self._process_where(where.left, target_table)
+                self._process_where(where.right, target_table)
+            elif isinstance(where, exp.Column):
+                target_column = f"{target_table}.{where.name}"
+                source_column = f"{where.table}.{where.name}" if where.table else where.name
+                self._add_lineage(target_column, source_column)
+            elif isinstance(where, exp.Subquery):
+                subquery_table = 'subquery'
+                self._handle_select(where.this, subquery_table)
+        except Exception as e:
+            logger.error(f"Error in _process_where: {e}")
+
+    def _process_group_by(self, group_by: List[exp.Expression], target_table: str):
+        try:
+            for expr in group_by:
+                source_columns = self._get_source_columns(expr)
+                for source in source_columns:
+                    self._add_lineage(f"{target_table}.{expr.name}", source)
+        except Exception as e:
+            logger.error(f"Error in _process_group_by: {e}")
+
+    def _process_having(self, having: exp.Expression, target_table: str):
+        try:
+            self._process_where(having, target_table)
+        except Exception as e:
+            logger.error(f"Error in _process_having: {e}")
+
+    def _process_order_by(self, order_by: List[exp.Expression], target_table: str):
+        try:
+            for expr in order_by:
+                source_columns = self._get_source_columns(expr.expression)
+                for source in source_columns:
+                    self._add_lineage(f"{target_table}.{expr.expression.name}", source)
+        except Exception as e:
+            logger.error(f"Error in _process_order_by: {e}")
+
+    def _add_lineage(self, target: str, source: str):
+        logger.debug(f"Adding lineage: {source} -> {target}")
+        if target not in self.lineage:
+            self.lineage[target] = set()
+        self.lineage[target].add(source)
+
+def print_lineage(lineage: Dict[str, Set[str]]):
     if lineage:
         print("Lineage relationships:")
         for target, sources in lineage.items():
             for source in sources:
-                print(f"{source[0]}.{source[1]} -> {target[0]}.{target[1]}")
+                print(f"{source} -> {target}")
     else:
         print("No lineage relationships found.")
 
